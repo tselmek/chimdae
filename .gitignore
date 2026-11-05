@@ -1,6 +1,9 @@
 # build output
 dist/
 
+# local photos, loaded from the user's computer at runtime
+public/photos/
+
 # generated types
 .astro/
 

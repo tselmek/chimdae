@@ -1,11 +1,832 @@
 ---
-import Welcome from '../components/Welcome.astro';
+import ArrowLeftRight from '@lucide/astro/icons/arrow-left-right';
+import ClipboardPaste from '@lucide/astro/icons/clipboard-paste';
+import Copy from '@lucide/astro/icons/copy';
+import FolderOpen from '@lucide/astro/icons/folder-open';
+import FolderSync from '@lucide/astro/icons/folder-sync';
+import Lock from '@lucide/astro/icons/lock';
+import LockOpen from '@lucide/astro/icons/lock-open';
+import RefreshCw from '@lucide/astro/icons/refresh-cw';
+import Scan from '@lucide/astro/icons/scan';
+import Shuffle from '@lucide/astro/icons/shuffle';
+import ThumbsDown from '@lucide/astro/icons/thumbs-down';
+import ThumbsUp from '@lucide/astro/icons/thumbs-up';
 import Layout from '../layouts/Layout.astro';
 
-// Welcome to Astro! Wondering what to do next? Check out the Astro documentation at https://docs.astro.build
-// Don't want to use any of this? Delete everything in this file, the `assets`, `components`, and `layouts` directories, and start fresh.
+const SLOT_COUNT = 5;
+const DEFAULT_WIDTH_CM = 40;
+const DEFAULT_HEIGHT_CM = 60;
+const ICON_SIZE = 16;
 ---
 
 <Layout>
-	<Welcome />
+	<div class="toolbar">
+		<div class="group">
+			<button id="open-folder" class="button"><FolderOpen size={ICON_SIZE} /> Open folder</button>
+			<button id="reopen-folder" class="button" hidden>
+				<FolderSync size={ICON_SIZE} /> Reopen <span class="reopen-name"></span>
+			</button>
+			<input id="folder-input" type="file" multiple hidden />
+			<span id="photo-count" class="muted">No folder selected</span>
+			<label>
+				Width
+				<input id="width" class="size" type="number" min="0.1" step="0.1" value={DEFAULT_WIDTH_CM} />
+			</label>
+			<span class="muted">×</span>
+			<label>
+				Height
+				<input id="height" class="size" type="number" min="0.1" step="0.1" value={DEFAULT_HEIGHT_CM} />
+			</label>
+			<span class="muted">cm</span>
+		</div>
+		<div class="group">
+			<button id="randomize" class="button primary"><Shuffle size={ICON_SIZE} /> Randomize</button>
+			<div class="filters">
+				<label><input type="checkbox" data-include="like" checked /> Liked</label>
+				<label><input type="checkbox" data-include="unrated" checked /> Unrated</label>
+				<label><input type="checkbox" data-include="dislike" /> Disliked</label>
+			</div>
+		</div>
+		<div class="group">
+			<button id="copy" class="button"><Copy size={ICON_SIZE} /> Copy code</button>
+			<button id="import" class="button"><ClipboardPaste size={ICON_SIZE} /> Import</button>
+		</div>
+	</div>
+
+	<div id="grid" class="grid">
+		{
+			Array.from({ length: SLOT_COUNT }, (_, index) => (
+				<div class="slot" data-index={index}>
+					<div class="frame">
+						<div class="photo">
+							<img alt="" draggable="false" hidden />
+						</div>
+						{index < SLOT_COUNT - 1 && (
+							<button
+								class="swap-next"
+								data-action="swap-next"
+								title="Swap with next photo"
+								aria-label="Swap with next photo"
+							>
+								<ArrowLeftRight size={14} />
+							</button>
+						)}
+					</div>
+					<div class="name" />
+					<div class="actions">
+						<button class="button" data-action="swap" title="Swap" aria-label="Swap">
+							<RefreshCw size={ICON_SIZE} />
+						</button>
+						<button class="button" data-action="reset" title="Reset position and zoom" aria-label="Reset position and zoom">
+							<Scan size={ICON_SIZE} />
+						</button>
+						<button class="button" data-action="lock" title="Lock" aria-label="Lock">
+							<LockOpen class="when-unlocked" size={ICON_SIZE} />
+							<Lock class="when-locked" size={ICON_SIZE} />
+						</button>
+					</div>
+				</div>
+			))
+		}
+	</div>
+
+	<section class="library">
+		<h2 id="library-title" class="library-title" hidden>
+			All photos <span class="muted">Drag a photo onto a frame to display it</span>
+		</h2>
+		<div id="library" class="library-grid"></div>
+	</section>
+
+	<template id="thumb-template">
+		<div class="thumb">
+			<div class="thumb-image" draggable="true">
+				<img alt="" loading="lazy" decoding="async" draggable="false" />
+			</div>
+			<div class="thumb-name"></div>
+			<div class="thumb-actions">
+				<button class="button" data-rating="like" title="Like" aria-label="Like">
+					<ThumbsUp size={ICON_SIZE} />
+				</button>
+				<button class="button" data-rating="dislike" title="Dislike" aria-label="Dislike">
+					<ThumbsDown size={ICON_SIZE} />
+				</button>
+			</div>
+		</div>
+	</template>
 </Layout>
+
+<script>
+	import { createStore } from 'jotai/vanilla';
+	import { atomWithStorage } from 'jotai/vanilla/utils';
+
+	const SLOT_COUNT = 5;
+	const MIN_ZOOM = 1;
+	const MAX_ZOOM = 8;
+	const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|gif|avif)$/i;
+	const HANDLE_DB = 'chimdae';
+	const HANDLE_STORE = 'handles';
+	const HANDLE_KEY = 'photos';
+
+	type DirectoryHandle = FileSystemDirectoryHandle & {
+		values(): AsyncIterable<FileSystemDirectoryHandle | FileSystemFileHandle>;
+		queryPermission(options: { mode: 'read' }): Promise<PermissionState>;
+		requestPermission(options: { mode: 'read' }): Promise<PermissionState>;
+	};
+	type DirectoryPickerWindow = Window & {
+		showDirectoryPicker?: (options: { id: string; mode: 'read' }) => Promise<DirectoryHandle>;
+	};
+
+	type Slot = { name: string | null; locked: boolean; zoom: number; x: number; y: number };
+	type Rating = 'like' | 'dislike';
+	type SavedState = {
+		width: number;
+		height: number;
+		slots: Slot[];
+		ratings: Record<string, Rating>;
+		filters: string[];
+	};
+
+	const store = createStore();
+	const savedStateAtom = atomWithStorage<SavedState | null>('chimdae-state', null, undefined, { getOnInit: true });
+
+	const grid = document.querySelector('#grid') as HTMLDivElement;
+	let photos = new Map<string, string>();
+	let ratings = new Map<string, Rating>();
+	let slots: Slot[] = Array.from({ length: SLOT_COUNT }, () => ({ name: null, locked: false, zoom: 1, x: 0, y: 0 }));
+	let drag: { slot: Slot; rect: DOMRect; clientX: number; clientY: number; x: number; y: number } | null = null;
+	const widthInput = document.querySelector('#width') as HTMLInputElement;
+	const heightInput = document.querySelector('#height') as HTMLInputElement;
+	const filterInputs = [...document.querySelectorAll<HTMLInputElement>('[data-include]')];
+	let width = Number(widthInput.value);
+	let height = Number(heightInput.value);
+
+	const slotElements = [...document.querySelectorAll<HTMLDivElement>('.slot')];
+	slotElements.forEach((element) => element.querySelector('img')!.addEventListener('load', render));
+
+	const library = document.querySelector('#library') as HTMLDivElement;
+	const thumbTemplate = document.querySelector('#thumb-template') as HTMLTemplateElement;
+
+	function save() {
+		store.set(savedStateAtom, {
+			width,
+			height,
+			slots,
+			ratings: Object.fromEntries(ratings),
+			filters: filterInputs.filter((input) => input.checked).map((input) => input.dataset.include!),
+		});
+	}
+
+	function randomPool() {
+		const included = filterInputs.filter((input) => input.checked).map((input) => input.dataset.include);
+		return [...photos.keys()].filter((name) => included.includes(ratings.get(name) ?? 'unrated'));
+	}
+
+	function pickRandom(exclude: (string | null)[], pool = randomPool()) {
+		const candidates = pool.filter((name) => !exclude.includes(name));
+		return candidates.length ? candidates[Math.floor(Math.random() * candidates.length)] : null;
+	}
+
+	function setPhoto(slot: Slot, name: string | null) {
+		Object.assign(slot, { name, zoom: 1, x: 0, y: 0 });
+	}
+
+	function slotOf(element: Element) {
+		return slots[Number(element.closest<HTMLDivElement>('.slot')!.dataset.index)];
+	}
+
+	function render() {
+		grid.style.setProperty('--ratio', `${width} / ${height}`);
+		slots.forEach((slot, index) => {
+			const element = slotElements[index];
+			const img = element.querySelector('img')!;
+			const url = slot.name ? photos.get(slot.name) : undefined;
+			img.hidden = !url;
+			if (url && img.getAttribute('src') !== url) img.src = url;
+
+			const loaded = img.complete && img.naturalWidth > 0;
+			const frameRatio = width / height;
+			const imageRatio = loaded ? img.naturalWidth / img.naturalHeight : frameRatio;
+			const coverWidth = Math.max(1, imageRatio / frameRatio) * 100;
+			const coverHeight = Math.max(1, frameRatio / imageRatio) * 100;
+			if (loaded) {
+				const maxX = (coverWidth * slot.zoom) / 2 - 50;
+				const maxY = (coverHeight * slot.zoom) / 2 - 50;
+				slot.x = Math.min(maxX, Math.max(-maxX, slot.x));
+				slot.y = Math.min(maxY, Math.max(-maxY, slot.y));
+			}
+			img.style.width = `${coverWidth}%`;
+			img.style.height = `${coverHeight}%`;
+			img.style.left = `${50 + slot.x}%`;
+			img.style.top = `${50 + slot.y}%`;
+			img.style.transform = `translate(-50%, -50%) scale(${slot.zoom})`;
+			element.querySelector('.name')!.textContent =
+				slot.name && !url && photos.size > 0 ? `Missing: ${slot.name}` : (slot.name ?? '');
+			element.classList.toggle('locked', slot.locked);
+			element.querySelector<HTMLButtonElement>('[data-action="lock"]')!.title = slot.locked ? 'Unlock' : 'Lock';
+			element.querySelector<HTMLButtonElement>('[data-action="swap"]')!.disabled = slot.locked;
+		});
+		save();
+	}
+
+	function randomize() {
+		const pool = randomPool();
+		const shown = slots.filter((slot) => slot.locked).map((slot) => slot.name);
+		for (const slot of slots) {
+			if (slot.locked) continue;
+			setPhoto(slot, pickRandom(shown, pool));
+			shown.push(slot.name);
+		}
+		render();
+	}
+
+	function renderLibrary() {
+		library.replaceChildren(
+			...[...photos].map(([name, url]) => {
+				const thumb = thumbTemplate.content.firstElementChild!.cloneNode(true) as HTMLDivElement;
+				thumb.dataset.name = name;
+				thumb.querySelector('img')!.src = url;
+				thumb.querySelector('.thumb-name')!.textContent = name;
+				return thumb;
+			}),
+		);
+		document.querySelector<HTMLHeadingElement>('#library-title')!.hidden = photos.size === 0;
+		updateRatings();
+	}
+
+	function updateRatings() {
+		for (const thumb of library.querySelectorAll<HTMLDivElement>('.thumb')) {
+			const rating = ratings.get(thumb.dataset.name!);
+			thumb.classList.toggle('liked', rating === 'like');
+			thumb.classList.toggle('disliked', rating === 'dislike');
+		}
+		save();
+	}
+
+	for (const input of filterInputs) input.addEventListener('change', save);
+
+	library.addEventListener('click', (event) => {
+		const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-rating]');
+		if (!button) return;
+		const name = button.closest<HTMLDivElement>('.thumb')!.dataset.name!;
+		const rating = button.dataset.rating as 'like' | 'dislike';
+		if (ratings.get(name) === rating) ratings.delete(name);
+		else ratings.set(name, rating);
+		updateRatings();
+	});
+
+	for (const input of [widthInput, heightInput]) {
+		input.addEventListener('input', () => {
+			if (!(Number(widthInput.value) > 0 && Number(heightInput.value) > 0)) return;
+			width = Number(widthInput.value);
+			height = Number(heightInput.value);
+			render();
+		});
+	}
+
+	document.querySelector('#randomize')!.addEventListener('click', () => {
+		if (photos.size === 0) return alert('Open a photo folder first');
+		if (randomPool().length === 0) return alert('No photos match the selected filters');
+		randomize();
+	});
+
+	grid.addEventListener('click', (event) => {
+		const button = (event.target as HTMLElement).closest('button');
+		if (!button) return;
+		const slot = slotOf(button);
+		if (button.dataset.action === 'lock') slot.locked = !slot.locked;
+		if (button.dataset.action === 'swap') setPhoto(slot, pickRandom(slots.map((s) => s.name)) ?? slot.name);
+		if (button.dataset.action === 'reset') setPhoto(slot, slot.name);
+		if (button.dataset.action === 'swap-next') {
+			const index = slots.indexOf(slot);
+			[slots[index], slots[index + 1]] = [slots[index + 1], slots[index]];
+		}
+		render();
+	});
+
+	library.addEventListener('dragstart', (event) => {
+		const thumb = (event.target as HTMLElement).closest<HTMLDivElement>('.thumb');
+		if (thumb) event.dataTransfer!.setData('text/plain', thumb.dataset.name!);
+	});
+
+	grid.addEventListener('dragover', (event) => {
+		const photo = (event.target as HTMLElement).closest('.photo');
+		if (!photo) return;
+		event.preventDefault();
+		photo.classList.add('drop-target');
+	});
+
+	grid.addEventListener('dragleave', (event) => {
+		(event.target as HTMLElement).closest('.photo')?.classList.remove('drop-target');
+	});
+
+	grid.addEventListener('drop', (event) => {
+		const photo = (event.target as HTMLElement).closest('.photo');
+		const name = event.dataTransfer!.getData('text/plain');
+		if (!photo || !photos.has(name)) return;
+		event.preventDefault();
+		photo.classList.remove('drop-target');
+		const target = slotOf(photo);
+		const sourceIndex = slots.findIndex((slot) => slot.name === name);
+		if (sourceIndex === -1) setPhoto(target, name);
+		else {
+			const targetIndex = slots.indexOf(target);
+			[slots[sourceIndex], slots[targetIndex]] = [slots[targetIndex], slots[sourceIndex]];
+		}
+		render();
+	});
+
+	grid.addEventListener('pointerdown', (event) => {
+		const photo = (event.target as HTMLElement).closest<HTMLDivElement>('.photo');
+		if (!photo) return;
+		const slot = slotOf(photo);
+		photo.setPointerCapture(event.pointerId);
+		drag = { slot, rect: photo.getBoundingClientRect(), clientX: event.clientX, clientY: event.clientY, x: slot.x, y: slot.y };
+	});
+
+	grid.addEventListener('pointermove', (event) => {
+		if (!drag) return;
+		drag.slot.x = drag.x + ((event.clientX - drag.clientX) / drag.rect.width) * 100;
+		drag.slot.y = drag.y + ((event.clientY - drag.clientY) / drag.rect.height) * 100;
+		render();
+	});
+
+	grid.addEventListener('pointerup', () => (drag = null));
+	grid.addEventListener('pointercancel', () => (drag = null));
+
+	grid.addEventListener(
+		'wheel',
+		(event) => {
+			const photo = (event.target as HTMLElement).closest<HTMLDivElement>('.photo');
+			if (!photo) return;
+			event.preventDefault();
+			const slot = slotOf(photo);
+			const rect = photo.getBoundingClientRect();
+			const cursorX = ((event.clientX - rect.left) / rect.width - 0.5) * 100;
+			const cursorY = ((event.clientY - rect.top) / rect.height - 0.5) * 100;
+			const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, slot.zoom * Math.exp(-event.deltaY * 0.002)));
+			const factor = zoom / slot.zoom;
+			slot.x = cursorX - factor * (cursorX - slot.x);
+			slot.y = cursorY - factor * (cursorY - slot.y);
+			slot.zoom = zoom;
+			render();
+		},
+		{ passive: false },
+	);
+
+	grid.addEventListener('dblclick', (event) => {
+		const photo = (event.target as HTMLElement).closest('.photo');
+		if (!photo) return;
+		const slot = slotOf(photo);
+		setPhoto(slot, slot.name);
+		render();
+	});
+
+	document.querySelector('#copy')!.addEventListener('click', async () => {
+		const shared = slots.map(({ name, zoom, x, y }) => ({ name, zoom: +zoom.toFixed(3), x: +x.toFixed(2), y: +y.toFixed(2) }));
+		const code = btoa(encodeURIComponent(JSON.stringify({ width, height, photos: shared })));
+		await navigator.clipboard.writeText(code);
+		alert('Code copied to clipboard');
+	});
+
+	document.querySelector('#import')!.addEventListener('click', () => {
+		const code = prompt('Paste a combination code');
+		if (!code) return;
+		try {
+			const data = JSON.parse(decodeURIComponent(atob(code.trim())));
+			width = data.width;
+			height = data.height;
+			widthInput.value = String(width);
+			heightInput.value = String(height);
+			slots = Array.from({ length: SLOT_COUNT }, (_, index) => ({
+				name: null,
+				zoom: 1,
+				x: 0,
+				y: 0,
+				...data.photos[index],
+				locked: true,
+			}));
+			render();
+		} catch {
+			alert('Invalid code');
+		}
+	});
+
+	const saved = store.get(savedStateAtom);
+	if (saved) {
+		width = saved.width;
+		height = saved.height;
+		widthInput.value = String(width);
+		heightInput.value = String(height);
+		slots = saved.slots;
+		ratings = new Map(Object.entries(saved.ratings));
+		for (const input of filterInputs) input.checked = saved.filters.includes(input.dataset.include!);
+	}
+	const photoCount = document.querySelector('#photo-count') as HTMLSpanElement;
+	const reopenButton = document.querySelector('#reopen-folder') as HTMLButtonElement;
+	const folderInput = document.querySelector('#folder-input') as HTMLInputElement;
+	folderInput.webkitdirectory = true;
+	const pickerWindow = window as DirectoryPickerWindow;
+
+	function loadPhotos(files: File[], folderName: string) {
+		for (const url of photos.values()) URL.revokeObjectURL(url);
+		photos = new Map(
+			files
+				.filter((file) => IMAGE_EXTENSIONS.test(file.name))
+				.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+				.map((file) => [file.name, URL.createObjectURL(file)]),
+		);
+		photoCount.textContent = `${photos.size} photos in ${folderName}`;
+		reopenButton.hidden = true;
+		renderLibrary();
+		if (slots.some((slot) => slot.name && photos.has(slot.name))) render();
+		else randomize();
+	}
+
+	async function loadDirectory(handle: DirectoryHandle) {
+		const files: File[] = [];
+		for await (const entry of handle.values()) {
+			if (entry.kind === 'file') files.push(await entry.getFile());
+		}
+		loadPhotos(files, handle.name);
+	}
+
+	function openHandleStore(mode: IDBTransactionMode) {
+		return new Promise<IDBObjectStore>((resolve, reject) => {
+			const request = indexedDB.open(HANDLE_DB, 1);
+			request.onupgradeneeded = () => request.result.createObjectStore(HANDLE_STORE);
+			request.onsuccess = () => resolve(request.result.transaction(HANDLE_STORE, mode).objectStore(HANDLE_STORE));
+			request.onerror = () => reject(request.error);
+		});
+	}
+
+	async function saveHandle(handle: DirectoryHandle) {
+		(await openHandleStore('readwrite')).put(handle, HANDLE_KEY);
+	}
+
+	async function loadHandle() {
+		const handles = await openHandleStore('readonly');
+		return new Promise<DirectoryHandle | undefined>((resolve, reject) => {
+			const request = handles.get(HANDLE_KEY);
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(request.error);
+		});
+	}
+
+	document.querySelector('#open-folder')!.addEventListener('click', async () => {
+		if (!pickerWindow.showDirectoryPicker) return folderInput.click();
+		try {
+			const handle = await pickerWindow.showDirectoryPicker({ id: HANDLE_KEY, mode: 'read' });
+			await loadDirectory(handle);
+			await saveHandle(handle);
+		} catch (error) {
+			if ((error as DOMException).name !== 'AbortError') throw error;
+		}
+	});
+
+	folderInput.addEventListener('change', () => {
+		const files = [...folderInput.files!].filter((file) => file.webkitRelativePath.split('/').length === 2);
+		if (files.length) loadPhotos(files, files[0].webkitRelativePath.split('/')[0]);
+		folderInput.value = '';
+	});
+
+	async function restoreFolder() {
+		if (!pickerWindow.showDirectoryPicker) return;
+		const handle = await loadHandle().catch(() => undefined);
+		if (!handle) return;
+		if ((await handle.queryPermission({ mode: 'read' })) === 'granted') return loadDirectory(handle);
+		reopenButton.querySelector('.reopen-name')!.textContent = handle.name;
+		reopenButton.hidden = false;
+		reopenButton.onclick = async () => {
+			if ((await handle.requestPermission({ mode: 'read' })) === 'granted') await loadDirectory(handle);
+		};
+	}
+
+	renderLibrary();
+	render();
+	restoreFolder();
+</script>
+
+<style>
+	:global(body) {
+		font-family: system-ui, sans-serif;
+		background: #fdfdfd;
+		color: #2a2622;
+	}
+
+	.toolbar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: center;
+		gap: 12px 28px;
+		padding: 20px 24px;
+	}
+
+	.group {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.group label {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 14px;
+	}
+
+	.muted {
+		color: #8a837b;
+		font-size: 14px;
+	}
+
+	.size {
+		width: 4.5em;
+		padding: 6px 8px;
+		border: 1px solid #ddd6cc;
+		border-radius: 8px;
+		font: inherit;
+		font-size: 14px;
+		background: #fff;
+	}
+
+	.size:focus {
+		outline: 2px solid #c9a46c;
+		outline-offset: -1px;
+	}
+
+	.button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		padding: 7px 12px;
+		border: 1px solid #ddd6cc;
+		border-radius: 8px;
+		background: #fff;
+		color: inherit;
+		font: inherit;
+		font-size: 14px;
+		cursor: pointer;
+		transition:
+			background 0.15s,
+			border-color 0.15s;
+	}
+
+	.button:hover:not(:disabled) {
+		background: #f5f1eb;
+	}
+
+	.button:disabled {
+		opacity: 0.4;
+		cursor: default;
+	}
+
+	.primary {
+		background: #2a2622;
+		border-color: #2a2622;
+		color: #fff;
+	}
+
+	.primary:hover:not(:disabled) {
+		background: #45403a;
+	}
+
+	.grid {
+		--ratio: 3 / 4;
+		--wood: 14px;
+		display: flex;
+		justify-content: center;
+		gap: 20px;
+		padding: 8px 24px 24px;
+	}
+
+	.slot {
+		width: min(
+			calc((100vw - 48px - 4 * 20px) / 5),
+			calc((100vh - 230px) * var(--ratio) + 2 * var(--wood))
+		);
+	}
+
+	.swap-next {
+		position: absolute;
+		top: 50%;
+		right: -10px;
+		z-index: 2;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 26px;
+		height: 26px;
+		padding: 0;
+		border: 1px solid #ddd6cc;
+		border-radius: 50%;
+		background: #fff;
+		color: inherit;
+		cursor: pointer;
+		opacity: 0.35;
+		transform: translate(50%, -50%);
+		transition: opacity 0.15s;
+	}
+
+	.swap-next:hover {
+		opacity: 1;
+	}
+
+	.photo.drop-target::after {
+		box-shadow: inset 0 0 0 3px #5b9a6b;
+	}
+
+	.frame {
+		position: relative;
+		padding: var(--wood);
+		background:
+			repeating-linear-gradient(
+				90deg,
+				rgb(150 105 55 / 0.09) 0 1px,
+				transparent 1px 4px,
+				rgb(150 105 55 / 0.05) 4px 6px,
+				transparent 6px 11px
+			),
+			linear-gradient(160deg, #eed9b5, #dfc193 45%, #ebd3aa 70%, #d9b987);
+		box-shadow:
+			inset 1px 1px 0 rgb(255 255 255 / 0.5),
+			inset -1px -1px 0 rgb(120 80 35 / 0.3),
+			0 10px 20px -6px rgb(70 45 20 / 0.3);
+	}
+
+	.photo {
+		position: relative;
+		aspect-ratio: var(--ratio);
+		overflow: hidden;
+		background: #f1eee9;
+		cursor: grab;
+		touch-action: none;
+		user-select: none;
+	}
+
+	.photo:active {
+		cursor: grabbing;
+	}
+
+	.photo::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		box-shadow:
+			inset 0 0 0 1px rgb(110 75 35 / 0.35),
+			inset 1px 2px 5px rgb(0 0 0 / 0.3);
+		pointer-events: none;
+	}
+
+	.photo img {
+		position: absolute;
+		display: block;
+		max-width: none;
+	}
+
+	img[hidden],
+	.button[hidden] {
+		display: none;
+	}
+
+	.name {
+		margin-top: 10px;
+		color: #8a837b;
+		font-size: 12px;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		height: 1.2em;
+		line-height: 1.2em;
+	}
+
+	.actions {
+		display: flex;
+		gap: 6px;
+		margin-top: 8px;
+	}
+
+	.actions .button {
+		flex: 1;
+		padding: 7px;
+	}
+
+	.button svg {
+		flex-shrink: 0;
+	}
+
+	.when-locked,
+	.slot.locked .when-unlocked {
+		display: none;
+	}
+
+	.slot.locked .when-locked {
+		display: block;
+	}
+
+	.filters {
+		display: flex;
+		gap: 10px;
+		margin-left: 4px;
+	}
+
+	.filters label {
+		gap: 4px;
+		cursor: pointer;
+	}
+
+	.filters input {
+		margin: 0;
+		accent-color: #2a2622;
+	}
+
+	.library {
+		padding: 16px 24px 48px;
+		border-top: 1px solid #eee8df;
+	}
+
+	.library-title {
+		margin: 8px 0 16px;
+		font-size: 15px;
+		font-weight: 600;
+	}
+
+	.library-title .muted {
+		margin-left: 8px;
+		font-size: 13px;
+		font-weight: 400;
+	}
+
+	.library-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(120px, 160px));
+		justify-content: center;
+		gap: 16px;
+	}
+
+	.thumb-image {
+		position: relative;
+		cursor: grab;
+		aspect-ratio: 1;
+		overflow: hidden;
+		border-radius: 8px;
+		background: #f1eee9;
+		outline: 2px solid transparent;
+		outline-offset: 2px;
+		transition: opacity 0.15s;
+	}
+
+	.thumb-image img {
+		display: block;
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
+
+	.thumb-name {
+		margin-top: 6px;
+		color: #8a837b;
+		font-size: 12px;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+	}
+
+	.thumb-actions {
+		display: flex;
+		gap: 6px;
+		margin-top: 6px;
+	}
+
+	.thumb-actions .button {
+		flex: 1;
+		padding: 5px;
+	}
+
+	.thumb.liked .thumb-image {
+		outline-color: #5b9a6b;
+	}
+
+	.thumb.liked [data-rating='like'] {
+		background: #5b9a6b;
+		border-color: #5b9a6b;
+		color: #fff;
+	}
+
+	.thumb.disliked .thumb-image {
+		opacity: 0.35;
+	}
+
+	.thumb.disliked [data-rating='dislike'] {
+		background: #b85c50;
+		border-color: #b85c50;
+		color: #fff;
+	}
+
+	.slot.locked [data-action='lock'] {
+		background: #2a2622;
+		border-color: #2a2622;
+		color: #fff;
+	}
+</style>

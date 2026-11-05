@@ -12,6 +12,8 @@
     "astro": "astro"
   },
   "dependencies": {
-    "astro": "^7.4.1"
+    "@lucide/astro": "^1.59.0",
+    "astro": "^7.4.1",
+    "jotai": "^3.0.1"
   }
 }
